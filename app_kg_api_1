@@ -1,0 +1,104 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Dict
+from neo4j import GraphDatabase
+import requests
+import openai
+import re
+
+# === OpenAI Configuration ===
+client = openai.OpenAI(
+    api_key="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"
+)
+MODEL_NAME = "gpt-4o-2024-08-06"
+
+# === Neo4j Configuration ===
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_USER = "neo4j"
+NEO4J_PASSWORD = "palatiou"
+
+# === FastAPI App ===
+app = FastAPI(title="ASD KG API", description="Cypher + NL2Cypher + Natural Response", version="1.1")
+
+# === Neo4j Driver ===
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+
+# --- MODELS ---
+class CypherQuery(BaseModel):
+    query: str
+    parameters: Dict = {}
+
+class NLQuery(BaseModel):
+    question: str
+
+# === /query: Direct Cypher execution ===
+@app.post("/query")
+def run_cypher_query(request: CypherQuery):
+    try:
+        with driver.session() as session:
+            result = session.run(request.query, request.parameters)
+            records = [record.data() for record in result]
+        return {"status": "success", "results": records}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# === /ask: NL → Cypher → Neo4j → natural response ===
+@app.post("/ask")
+def ask_question(request: NLQuery):
+    try:
+        print("🔍 Question:", request.question)
+
+        # Prompt προς LLM για παραγωγή Cypher
+        prompt = f"""
+You are a Cypher expert for Neo4j. Translate the question into Cypher only, no explanation.
+
+Question: "{request.question}"
+"""
+
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+
+        raw_cypher = response.choices[0].message.content.strip()
+        cypher = re.sub(r"^```[a-z]*\n?", "", raw_cypher).strip("` \n")
+        print("✅ Cleaned Cypher:\n", cypher)
+
+        # Εκτέλεση Cypher
+        with driver.session() as session:
+            result = session.run(cypher)
+            records = [record.data() for record in result]
+
+        print("🧠 Cypher results:", records)
+
+        # Ανάλυση αποτελέσματος σε φυσική γλώσσα
+        followup_prompt = f"""
+You are an assistant who answers based only on the given Cypher result from a Neo4j knowledge graph.
+
+Original Question:
+{request.question}
+
+Cypher Result:
+{records}
+
+Give a short, clear answer in natural language based only on the result above.
+"""
+
+        followup = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": followup_prompt}],
+            temperature=0.3
+        )
+
+        final_answer = followup.choices[0].message.content.strip()
+
+        return {
+            "answer": final_answer,
+            "cypher": cypher,
+            "results": records
+        }
+
+    except Exception as e:
+        print("❌ Error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
